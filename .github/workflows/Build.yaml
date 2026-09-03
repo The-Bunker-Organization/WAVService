@@ -1,0 +1,59 @@
+name: WavService RBXM Generator
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rokit
+        run: |
+          curl -sSf https://raw.githubusercontent.com/rojo-rbx/rokit/main/scripts/install.sh | bash
+          echo "$HOME/.rokit/bin" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: |
+          rokit trust rojo-rbx/rojo
+          rokit install
+
+      - name: Build RBXMX
+        run: rojo build default.project.json -o ../WavService.rbxmx
+
+      - name: Format commit message
+        id: commit
+        shell: bash
+        run: |
+          MESSAGE="$(git log -1 --pretty=%B)"
+
+          TITLE="$(printf '%s\n' "$MESSAGE" | head -n 1)"
+          DESCRIPTION="$(printf '%s\n' "$MESSAGE" | tail -n +2)"
+
+          {
+            echo "body<<EOF"
+            echo "## $TITLE"
+
+            if [ -n "$DESCRIPTION" ]; then
+              printf '%s\n' "$DESCRIPTION" | sed 's/^/> /'
+            fi
+
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: WavService Build ${{ github.run_number }}
+          files: WavService.rbxmx
+          body: ${{ steps.commit.outputs.body }}

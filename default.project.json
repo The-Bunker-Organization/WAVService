@@ -1,0 +1,6 @@
+{
+	"name": "WavService",
+	"tree": {
+		"$path": "src/MainModule"
+	}
+}
