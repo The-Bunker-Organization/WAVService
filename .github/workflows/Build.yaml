@@ -1,4 +1,4 @@
-name: WavService RBXM Generator
+name: WavService RBXMX Generator
 
 on:
   push:
@@ -28,7 +28,12 @@ jobs:
           rokit install
 
       - name: Build RBXMX
-        run: rojo build default.project.json -o ../WavService.rbxmx
+        run: |
+          rokit exec rojo build default.project.json -o WavService.rbxmx
+
+      - name: Verify build
+        run: |
+          ls -lh WavService.rbxmx
 
       - name: Format commit message
         id: commit
