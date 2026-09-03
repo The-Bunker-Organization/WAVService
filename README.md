@@ -11,9 +11,9 @@
 
 ### Features
 
-* Runtime image loading without publishing
+* Runtime Sound loading without publishing
 * Works through a Roblox env by default
-* Parse any PNG type file
+* Parse any .Wav type file
 * Currently in **Beta**
 
 ## Building
@@ -21,7 +21,7 @@
 The project uses a `Rojo` format that can be built as a RBXM or RBXMX,Check [Releases](https://github.com/The-Bunker-Organization/WavService/releases) for the RBXM without building yourself.
 
 ## Using RBXM
-Just path it to your instance or GUI for using it,it will generate a GUI for it using the PNG binary parsed
+Just path it to your instance,it ill add a hopperbin with the functionality inside it
 
 ### Basic Format
 ```
