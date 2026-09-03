@@ -8,9 +8,6 @@
 ## About
 
 **WavService** is a runtime **Sound Player** that allows you to load `.wav` files directly Roblox sound services directly.
-## About
-
-**PNGService** is a runtime **PNG loader** that allows you to load PNGS files directly inside a Roblox environment without publishing.
 
 ### Features
 
