@@ -18,20 +18,34 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rokit
+        shell: bash
         run: |
           curl -sSf https://raw.githubusercontent.com/rojo-rbx/rokit/main/scripts/install.sh | bash
           echo "$HOME/.rokit/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.rokit/bin:$PATH"
 
       - name: Install tools
+        shell: bash
         run: |
+          export PATH="$HOME/.rokit/bin:$PATH"
           rokit trust rojo-rbx/rojo
           rokit install
 
-      - name: Build RBXMX
+      - name: Verify Rojo
+        shell: bash
         run: |
+          export PATH="$HOME/.rokit/bin:$PATH"
+          command -v rojo
+          rojo --version
+
+      - name: Build RBXMX
+        shell: bash
+        run: |
+          export PATH="$HOME/.rokit/bin:$PATH"
           rojo build default.project.json -o WavService.rbxmx
 
       - name: Verify build
+        shell: bash
         run: |
           ls -lh WavService.rbxmx
 
