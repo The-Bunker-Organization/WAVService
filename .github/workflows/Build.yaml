@@ -29,7 +29,7 @@ jobs:
 
       - name: Build RBXMX
         run: |
-          rokit exec rojo build default.project.json -o WavService.rbxmx
+          rojo build default.project.json -o WavService.rbxmx
 
       - name: Verify build
         run: |
