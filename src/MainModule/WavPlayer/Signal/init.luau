@@ -1,20 +1,20 @@
 --[[
 	-- NamedSignal --
 
-	v2.0.4
+	v2.3.2
 
 	A Signal implementation for Luau, with a nice balance of ergonomics, performance, and features.
 	Most notably, you can use function types to get named parameters!
 
 	Comprehensive documentation and additional info is available at:
-		https://Nowoshire.github.io/NamedSignal
+		https://personal.averlyst.dev/NamedSignal
 
 	This software is licensed under the MIT License:
-		https://github.com/Nowoshire/NamedSignal/blob/main/LICENSE
+		https://github.com/averlyst/NamedSignal/blob/main/LICENSE
 
 		MIT License
 
-		Copyright (c) 2026 Nowoshire
+		Copyright (c) 2026 Averlyst
 
 		Permission is hereby granted, free of charge, to any person obtaining a copy
 		of this software and associated documentation files (the "Software"), to deal
@@ -38,94 +38,50 @@
 --!strict
 --!optimize 2
 
--- Constants --
--- Controls whether event handlers are fired immediately or deferred.
--- "Immediate" is the recommended default for performance reasons.
-const SIGNAL_BEHAVIOR: "Immediate" | "Deferred"
-	= "Immediate"
+-- Configuration --
+--[[
+	> [!WARNING] No Stability Guarantee
+	> Flags are unstable and subject to change or removal.
+	> They are set to the recommended values by default, only change these if you know what you're doing.
+]]
 
--- Whether to use the Roblox task library to handle invocations when available.
--- Only applicable when using Immediate signal behavior, always uses task.defer on Deferred mode when available.
--- Using the task library results in a roughly 2-4x worse firing performance, but provides error information in output.
-const USE_TASK_LIBRARY = false
+--[[
+	Controls the quality of error information provided in the output in exchange for performance.
+	- "Auto" uses "Full" in Roblox Studio, and "Warn" in production.
+	- "Full" uses task.spawn when available, providing the full error traceback with jump-to functionality, at the cost of worse performance.
+	- "Warn" uses coroutine.resume but outputs the error message with a simplified traceback. Better performance than "Full".
+	- "None" uses coroutine.resume but provides no error information. Best performance but not recommended for typical use.
+	"Full" is the recommended default.
 
--- Function used for resuming threads used for invocation, switched based on signal behavior and task library availability.
-const resumeInvokeThread = task and (
-	SIGNAL_BEHAVIOR == "Deferred" and task.defer or USE_TASK_LIBRARY and task.spawn
-) or coroutine.resume
+	> [!CAUTION] Here be dragons!
+	> Switching to modes other than "Full" may lead to unexpected C-side issues in rare cases.
+	> It's strongly recommended that you do not change this unless you really need the extra performance and are aware of the risks.
+]]
+const ERROR_INFO_MODE: "Auto" | "Full" | "Warn" | "None"
+	= "Full"
 
 -- Imports --
 const Types = require("@self/Types")
 
--- Thread Recycling --
---[[
-	Spawns a thread faster than the task library, only returns the created thread.
-]]
-const function spawnThread <A..., R...>(func: (A...) -> (R...), ...: A...): (thread)
-	const thread = coroutine.create(func)
-	coroutine.resume(thread, ...)
-	return thread
-end
-
--- "Fast" thread cache, slightly improves the performance of non-yielding dispatch.
-local tL1: thread?
-
--- "Slow" thread cache
-const threadPool = {} :: {thread}
-
---[[
-	Calls the given callback with the given arguments, then adds the thread into the cache for reuse.
-]]
-const function callOnAndCacheThread(thread: thread, callback: (...any) -> (), ...: any): ()
-	callback(...)
-
-	-- Callback finished running, this thread is free again, add it back to the cache
-	if tL1 then
-		table.insert(threadPool, thread)
-	else
-		tL1 = thread
-	end
-end
-
---[[
-	Indefinitely looping function body of event handler coroutines.
-	Gets resumed with functions to run followed by arguments to run them with.
-]]
-const function eventHandlerRoutine(): ()
-	while true do
-		callOnAndCacheThread(coroutine.yield())
-	end
-end
-
---[[
-	Returns an available thread.
-]]
-const function getAvailableThread(): (thread)
-	local thread: thread
-	if tL1 then -- Check fast cache
-		thread = tL1
-		tL1 = nil
-	else
-		-- Check slow cache
-		const numThreads = #threadPool
-		if numThreads == 0 then
-			-- No thread is available in pool, return a new one.
-			return spawnThread(eventHandlerRoutine)
-		end
-
-		thread = threadPool[numThreads]
-		threadPool[numThreads] = nil -- Remove from free threads
-	end
-
-	-- Fix an edge case where if the cached handler thread is not suspended, the first listener will not run on the next invocation.
-	if coroutine.status(thread) ~= "suspended" then
-		return spawnThread(eventHandlerRoutine)
-	end
-
-	return thread
-end
-
 -- Deferred Mutation Helpers --
+
+--[[
+	Returns the next node pointer of the preserved tail connection while clearing its reference.
+]]
+const function popPreservedTailNext(signal: InternalSignal): (InternalConnection?)
+	const pTail = signal._pTail
+	if not pTail then return nil end
+
+	signal._pTail = nil
+	return pTail and pTail._next
+end
+
+const function removePreservedTailNext(signal: InternalSignal): ()
+	const existingPTail = signal._pTail
+	if existingPTail then
+		existingPTail._next = nil
+	end
+end
 
 --[[
 	Queues a mutation at the last mutation level, or creates a new one if one does not exist.
@@ -157,24 +113,134 @@ const function enqueueMutationLevel(mutationList: {{Types.SignalMutation}}, muta
 	end
 end
 
+-- Thread Logic --
+
+--[[
+	Creates a thread and resumes it immediately with itself as the only argument, then returns it.
+]]
+const function spawnThreadWithSelf(func: (...any) -> (...any)): (thread)
+	const thread = coroutine.create(func)
+	coroutine.resume(thread, thread)
+	return thread
+end
+
+--[[
+	Returns a boolean indicating if the given thread is resumable.
+]]
+const function isThreadResumable(co: thread): (boolean)
+	return coroutine.status(co) == "suspended"
+end
+
+local threadL1: thread?
+const threadL2: {thread?} = {}
+
+const function cacheThread(co: thread): ()
+	if not threadL1 then
+		threadL1 = co
+	else
+		table.insert(threadL2, co)
+	end
+end
+
+--[[
+	Runs a single listener cycle on the current thread.
+]]
+const function runListenerCycle(state: {InternalConnection}, signal: InternalSignal, ...: any): ()
+	local node = state[1]
+	while node do
+		state[1] = node._next or popPreservedTailNext(signal)
+
+		node.Callback(...)
+
+		-- Due to states being inaccessible to disconnections, the state may be stale.
+		-- This is an unfortunate cost we have to pay for correctness, but the more efficient dispatching technique
+		-- makes this well worth the single-digit percentage regression.
+		if node.Connected then
+			node = state[1]
+		else
+			node = node._next or popPreservedTailNext(signal)
+			state[1] = node
+		end
+	end
+end
+
+--[[
+	Indefinitely looping function body of dispatcher coroutines.
+]]
+const function dispatcherBody(co: thread): ()
+	while true do
+		runListenerCycle(coroutine.yield())
+		cacheThread(co)
+	end
+end
+
+--[[
+	Returns a dispatch thread, grabbing from cache or creating a new one.
+	Resume with a table with index 1 being the Connection node, Signal, and fire arguments.
+]]
+const function getDispatchThread(): (thread)
+	local thread: thread?
+	if threadL1 then
+		thread = threadL1
+		threadL1 = nil
+	else
+		const poolSize = #threadL2
+		if poolSize ~= 0 then
+			thread = threadL2[poolSize]
+			threadL2[poolSize] = nil
+		end
+	end
+
+	if not thread then
+		return spawnThreadWithSelf(dispatcherBody)
+	end
+
+	-- Threads can be closed externally! Check before reuse.
+	if not isThreadResumable(thread) then
+		return spawnThreadWithSelf(dispatcherBody)
+	end
+
+	return thread
+end
+
+const resumeThread = task and (
+	if ERROR_INFO_MODE == "Full"
+		or ERROR_INFO_MODE == "Auto" and typeof(game) == "Instance" and game:GetService("RunService"):IsStudio()
+		then task.spawn
+		else nil -- Fallback to below
+) or (
+	if ERROR_INFO_MODE == "Warn" then
+		(function(): ((thread, ...any) -> ()) -- "Auto" in production or "Warn" ERROR_INFO_MODE
+			const log = warn or print -- Portability, the environment might not have warn.
+
+			return function(co: thread, ...: any): ()
+				const success, err = coroutine.resume(co, ...)
+				if success then return end
+
+				-- About as close as we can get to normal error semantics, just with some minor styling differences.
+				-- Avoiding tostring conversions to get proper outputs of non-string error messages.
+				log(
+					"Error occurred during invocation:",
+					if err ~= nil then err else "Error occurred, no output from Luau.",
+					debug.traceback(co, "\nStack Begin") .. "Stack End"
+				)
+			end
+		end)()
+		else
+		coroutine.resume
+)
+
 -- Connection Class --
 const Connection = {}
 Connection.__index = Connection
 
-export type Connection<Signature = () -> ()> = Types.Connection<Signature>
+export type Connection<Signature = Types.DefaultSignature> = Types.Connection<Signature>
+export type GenericConnection<Params...> = Types.GenericConnection<Params...>
+export type WrapConnection<OtherSignal> = Types.WrapConnection<OtherSignal>
 type InternalConnection = Types.InternalConnection
 
---[[
-	Links the connection to the end of the signal.
-]]
-const function linkConnection(connection: InternalConnection, signal: InternalSignal): ()
-	if connection.Connected then return end
-	connection.Connected = true
-
-	const tail = signal._tail
-
-	-- Link the connection to the tail connection if it exists
-	if tail then
+const function baseLinkConnection(connection: InternalConnection, signal: InternalSignal, tail: InternalConnection?): ()
+	if tail then -- Link the connection to the tail connection if it exists
 		tail._next = connection
 		connection._prev = tail
 	else -- Otherwise, this is the first connection, set signal head to this.
@@ -184,25 +250,86 @@ const function linkConnection(connection: InternalConnection, signal: InternalSi
 	signal._tail = connection
 end
 
+const function linkConnection(connection: InternalConnection, signal: InternalSignal): ()
+	if connection.Connected then return end
+	connection.Connected = true
+
+	baseLinkConnection(connection, signal, signal._tail)
+end
+
 --[[
-	Unlinks the connection from the signal.
+	A variant of <code>linkConnection</code> that handles iterator invalidation edge cases.
 ]]
+const function linkConnectionNow(connection: InternalConnection, signal: InternalSignal): ()
+	if connection.Connected then return end
+	connection.Connected = true
+
+	local tail = signal._tail
+	if tail then
+		baseLinkConnection(connection, signal, tail)
+	else
+		-- In case the tail connection was disconnected during active iteration.
+		tail = signal._pTail
+		if tail then
+			if not tail._prev then
+				signal._head = connection
+			end
+
+			tail._next = connection
+		elseif not connection._prev then
+			signal._head = connection
+		end
+
+		signal._tail = connection
+	end
+end
+
+const function baseUnlinkConnection(prv: InternalConnection?, nxt: InternalConnection?, signal: InternalSignal): ()
+	if prv then
+		prv._next = nxt
+	else -- This was the first link in the list, set head to next
+		signal._head = nxt
+	end
+end
+
 const function unlinkConnection(connection: InternalConnection, signal: InternalSignal): ()
 	if not connection.Connected then return end
 	connection.Connected = false
 
 	-- Bridge gaps, set prev next to this one's next and vice versa.
+	-- Do NOT clear pointers, as it can cause iterator invalidation.
 	const prv, nxt = connection._prev, connection._next
 
-	if prv then
-		prv._next = nxt
-	else -- This was the first link in the list, set to next
-		signal._head = nxt
-	end
+	baseUnlinkConnection(prv, nxt, signal)
 
 	if nxt then
 		nxt._prev = prv
-	else -- This was the last link in the list, set to previous
+	else -- This was the last link in the list, set tail to previous
+		signal._tail = prv
+	end
+end
+
+--[[
+	A variant of <code>unlinkConnection</code> that handles iterator invalidation edge cases.
+]]
+const function unlinkConnectionNow(connection: InternalConnection, signal: InternalSignal): ()
+	if not connection.Connected then return end
+	connection.Connected = false
+
+	-- Bridge gaps, set prev next to this one's next and vice versa.
+	-- Do NOT clear pointers, as it can cause iterator invalidation.
+	const prv, nxt = connection._prev, connection._next
+
+	baseUnlinkConnection(prv, nxt, signal)
+
+	if nxt then
+		nxt._prev = prv
+	else -- This was the last link in the list, set tail to previous
+		if not prv then
+			removePreservedTailNext(signal)
+			signal._pTail = connection
+		end
+
 		signal._tail = prv
 	end
 end
@@ -211,55 +338,95 @@ function Connection.Disconnect(self: InternalConnection): ()
 	const signal = self.Signal
 	if signal._firing then
 		enqueueMutation(signal._mutations, {
-			f = unlinkConnection :: any,
-			c = self
+			f = unlinkConnection :: any, c = self
 		})
-		return
+	else
+		unlinkConnection(self, signal)
 	end
-
-	unlinkConnection(self, signal)
 end
 
 function Connection.DisconnectNow(self: InternalConnection): ()
-	unlinkConnection(self, self.Signal)
+	const signal = self.Signal
+	if signal._firing then
+		unlinkConnectionNow(self, signal)
+	else
+		unlinkConnection(self, signal)
+	end
 end
 
 function Connection.Reconnect(self: InternalConnection): ()
 	const signal = self.Signal
 	if signal._firing then
 		enqueueMutation(signal._mutations, {
-			f = linkConnection :: any,
-			c = self,
+			f = linkConnection :: any, c = self,
 		})
-		return
+	else
+		linkConnection(self, signal)
 	end
-
-	linkConnection(self, signal)
 end
 
 function Connection.ReconnectNow(self: InternalConnection): ()
-	linkConnection(self, self.Signal)
+	const signal = self.Signal
+	if signal._firing then
+		linkConnectionNow(self, self.Signal)
+	else
+		linkConnection(self, signal)
+	end
 end
 
--- No "-Now" variation is provided for `Connection:Destroy()`, as that would cause issues with deferred mutations.
+const function destroyConnection(connection: InternalConnection): ()
+	unlinkConnection(connection, connection.Signal)
+	table.clear(connection)
+	setmetatable(connection, nil)
+end
 
 function Connection.Destroy(self: InternalConnection): ()
-	unlinkConnection(self, self.Signal)
-	table.clear(self)
-	setmetatable(self, nil)
+	const signal = self.Signal
+	if signal._firing then
+		enqueueMutation(signal._mutations, {
+			f = destroyConnection :: any, c = self
+		})
+	else
+		destroyConnection(self)
+	end
+end
+
+function Connection.DestroyNow(self: InternalConnection): ()
+	const signal = self.Signal
+	if signal._firing then
+		unlinkConnectionNow(self, signal)
+
+		-- We can't clear the table now, as it may be the active node and cause iterator invalidation.
+		-- Schedule it to be cleared after dispatch.
+		enqueueMutation(signal._mutations, {
+			f = table.clear :: any, c = self
+		})
+
+		setmetatable(self, nil)
+	else
+		destroyConnection(self, signal)
+	end
 end
 
 -- Signal Class --
 const Signal = {}
 Signal.__index = Signal
 
--- NOTE: UDTFs currently can't serialize recursive types, use the GenericSignal type instead if you run into such issues.
-export type Signal<Signature = (...unknown) -> ()> = Types.Signal<Signature>
-
--- A generics-only alternative as a workaround for types that UDTFs can't serialize, or for compatibility with other signal implementations.
+export type Signal<Signature = Types.DefaultSignature> = Types.Signal<Signature>
 export type GenericSignal<Params...> = Types.GenericSignal<Params...>
-
+export type WrapSignal<OtherSignal> = Types.WrapSignal<OtherSignal>
 type InternalSignal = Types.InternalSignal
+
+function Signal.GetConnections(self: InternalSignal): ({Connection})
+	const connectionList: {InternalConnection} = {}
+	local connection = self._head
+	while connection do
+		table.insert(connectionList, connection)
+		connection = connection._next -- We don't need to account for pTails as we don't dispatch any listeners here.
+	end
+
+	return connectionList :: {Connection}
+end
 
 const function cancelAllMutations(self: InternalSignal): ()
 	if not self._firing then return end
@@ -277,24 +444,13 @@ end
 
 Signal.CancelAllMutations = cancelAllMutations
 
-const function baseDisconnectAll(signal: InternalSignal): ()
+const function disconnectAll(signal: InternalSignal): ()
 	local connection = signal._head
 	while connection do
 		connection.Connected = false
 		connection = connection._next -- Iterate
 	end
-end
 
-const function baseDisconnectAllRemoveNext(signal: InternalSignal): ()
-	local connection = signal._head
-	while connection do
-		connection.Connected = false
-		connection._next, connection = nil, connection._next -- Iterate and also remove _next to stop fire iteration
-	end
-end
-
-const function disconnectAll(signal: InternalSignal): ()
-	baseDisconnectAll(signal)
 	signal._head = nil
 	signal._tail = nil
 end
@@ -304,21 +460,49 @@ function Signal.DisconnectAll(self: InternalSignal): ()
 		enqueueMutation(self._mutations, {
 			f = disconnectAll :: any
 		})
-		return
+	else
+		disconnectAll(self)
 	end
+end
 
-	disconnectAll(self)
+--[[
+	Disconnects all connections from the signal.
+
+	Doesn't clear _head and _tail.
+	Sets _next to nil to intentionally interrupt dispatch.
+]]
+const function breakConnectionList(signal: InternalSignal): ()
+	local connection = signal._head
+	while connection do
+		connection.Connected = false
+		connection._next, connection = nil, connection._next -- Remove _next and iterate
+	end
 end
 
 function Signal.DisconnectAllNow(self: InternalSignal): ()
-	baseDisconnectAllRemoveNext(self)
-	self._head = nil
-	self._tail = nil
+	if self._firing then
+		breakConnectionList(self)
+		removePreservedTailNext(self)
+		self._head = nil
+
+		const tail = self._tail
+		if tail then
+			self._pTail = tail
+			self._tail = nil
+		end
+	else
+		disconnectAll(self)
+	end
 end
 
-const function destroy(signal: InternalSignal): ()
+const function destroySignal(signal: InternalSignal): ()
+	const wrapConnection = signal._wrapConnection
+	if wrapConnection then
+		wrapConnection:Disconnect()
+	end
+
 	cancelAllMutations(signal)
-	baseDisconnectAll(signal)
+	breakConnectionList(signal)
 
 	table.clear(signal)
 	setmetatable(signal, nil)
@@ -327,24 +511,17 @@ end
 function Signal.Destroy(self: InternalSignal): ()
 	if self._firing then
 		enqueueMutation(self._mutations, {
-			f = destroy :: any
+			f = destroySignal :: any
 		})
-		return
+	else
+		destroySignal(self)
 	end
-
-	destroy(self)
 end
 
-function Signal.DestroyNow(self: InternalSignal): ()
-	cancelAllMutations(self)
-	baseDisconnectAllRemoveNext(self)
-
-	table.clear(self)
-	setmetatable(self, nil)
-end
+Signal.DestroyNow = destroySignal
 
 --[[
-	Returns a new unlinked Connection, used during deferred connections where it's not immediately connected.
+	Returns a new unlinked Connection, used for deferred connections that are scheduled to connect at a later time.
 ]]
 const function newUnlinkedConnection(signal: InternalSignal, func: (...any) -> ()): (InternalConnection)
 	return setmetatable({
@@ -354,9 +531,6 @@ const function newUnlinkedConnection(signal: InternalSignal, func: (...any) -> (
 	}, Connection) :: any
 end
 
---[[
-	Returns a new linked Connection.
-]]
 const function newLinkedConnection(signal: InternalSignal, func: (...any) -> ()): (InternalConnection)
 	const tail = signal._tail
 	const connection: InternalConnection = setmetatable({
@@ -373,6 +547,35 @@ const function newLinkedConnection(signal: InternalSignal, func: (...any) -> ())
 	end
 
 	signal._tail = connection
+
+	return connection
+end
+
+--[[
+	A variant of <code>newLinkedConnection</code> that handles iterator invalidation edge cases.
+]]
+const function newLinkedConnectionNow(signal: InternalSignal, func: (...any) -> ()): (InternalConnection)
+	local tail = signal._tail
+	const connection: InternalConnection = setmetatable({
+		Connected = true,
+		Callback = func,
+		Signal = signal,
+		_prev = tail,
+	}, Connection) :: any
+
+	if tail then
+		tail._next = connection
+	else
+		tail = signal._pTail
+		signal._head = connection
+
+		if tail then
+			tail._next = connection
+		end
+	end
+
+	signal._tail = connection
+
 	return connection
 end
 
@@ -384,23 +587,35 @@ const function signalConnect(signal: InternalSignal, func: (...any) -> ()): (Int
 	if signal._firing then
 		const unlinked = newUnlinkedConnection(signal, func)
 		enqueueMutation(signal._mutations, {
-			f = linkConnection :: any,
-			c = unlinked
+			f = linkConnection :: any, c = unlinked
 		})
 
 		return unlinked
+	else
+		return newLinkedConnection(signal, func)
 	end
+end
 
-	return newLinkedConnection(signal, func)
+--[[
+	A variant of <code>signalConnect</code> that handles iterator invalidation edge cases.
+]]
+const function signalConnectNow(signal: InternalSignal, func: (...any) -> ()): (InternalConnection)
+	if signal._firing then
+		return newLinkedConnectionNow(signal, func)
+	else
+		return newLinkedConnection(signal, func)
+	end
 end
 
 Signal.Connect = signalConnect
-Signal.ConnectNow = newLinkedConnection
+Signal.ConnectNow = signalConnectNow
 
 const function signalOnce(signal: InternalSignal, func: (...any) -> ()): (InternalConnection)
 	local connection: InternalConnection
-	connection = signalConnect(signal, function(...: any)
-		unlinkConnection(connection :: InternalConnection, signal)
+	connection = signalConnect(signal, function(...: any): ()
+		-- Even though this is not the immediate-mode method, we still use unlinkConnectionNow, as the disconnection
+		-- happens during dispatch-time (it's effectively equivalent to DisconnectNow).
+		unlinkConnectionNow(connection :: InternalConnection, signal)
 		func(...)
 	end)
 
@@ -409,8 +624,8 @@ end
 
 const function signalOnceNow(signal: InternalSignal, func: (...any) -> ()): (InternalConnection)
 	local connection: InternalConnection
-	connection = newLinkedConnection(signal, function(...)
-		unlinkConnection(connection :: InternalConnection, signal)
+	connection = signalConnectNow(signal, function(...: any): ()
+		unlinkConnectionNow(connection :: InternalConnection, signal)
 		func(...)
 	end)
 
@@ -420,38 +635,54 @@ end
 Signal.Once = signalOnce
 Signal.OnceNow = signalOnceNow
 
+--[[
+	Yields the running thread, then unlinks the given connection from the signal, and returns any arguments returned from <code>coroutine.yield</code>.
+]]
+const function safeAwaitSignal(connection: InternalConnection, signal: InternalSignal): (...any)
+	const args = {coroutine.yield()}
+	unlinkConnectionNow(connection, signal) -- Attempt unlink after resuming to account for external resumption
+	return table.unpack(args)
+end
+
+const function resumeAwaiting(thread: thread, ...: any): ()
+	-- Check that the thread is resumable to avoid nuisance errors.
+	if isThreadResumable(thread) then
+		resumeThread(thread, ...)
+	end
+end
+
 function Signal.Wait(self: InternalSignal): (...any)
 	const thisThread = coroutine.running()
-	signalOnce(self, function(...: any)
-		resumeInvokeThread(thisThread, ...)
-	end)
-
-	return coroutine.yield()
+	return safeAwaitSignal(signalOnce(self, function(...: any): ()
+		resumeAwaiting(thisThread, ...)
+	end), self)
 end
 
 function Signal.WaitNow(self: InternalSignal): (...any)
 	const thisThread = coroutine.running()
-	signalOnceNow(self, function(...: any)
-		resumeInvokeThread(thisThread, ...)
-	end)
-
-	return coroutine.yield()
+	return safeAwaitSignal(signalOnceNow(self, function(...: any): ()
+		resumeAwaiting(thisThread, ...)
+	end), self)
 end
 
 --[[
 	Calls all currently connected functions and processes first-level mutations.
 ]]
-const function invokeListenersAndProcessMutations(signal: InternalSignal, mutationList: {{Types.SignalMutation}}, ...: any)
-	local connection = signal._head
-	while connection do
-		const thread = getAvailableThread()
-		resumeInvokeThread(thread, thread, connection.Callback, ...)
-		connection = connection._next
+const function processDispatch(signal: InternalSignal, mutationList: {{Types.SignalMutation}}, ...: any): ()
+	const head = signal._head
+	if not head then return end
+
+	-- Dispatcher with minimized thread resumption, multiple listeners are dispatched within a thread until one yields.
+	-- Some alternatives for shared state were considered such as a function with upvalues, however they ended up being
+	-- less performant than this table solution.
+	const state = {head}
+	while state[1] do
+		resumeThread(getDispatchThread(), state, signal, ...)
 	end
 
 	-- Apply first-level mutations.
-	-- While table.remove would return the firstMutations array if it exists, the majority of use cases will
-	-- see no mutations, so it would generally be more performant to index first, then call `table.remove`.
+	-- While table.remove would return the firstMutations array if it exists, the majority of use cases will see no
+	-- mutations, so it would generally be more performant to index first, then call `table.remove`.
 	const firstMutations = mutationList[1]
 	if not firstMutations then return end
 
@@ -462,9 +693,7 @@ const function invokeListenersAndProcessMutations(signal: InternalSignal, mutati
 		if not func then
 			-- The function is only undefined for re-entrant firing.
 			-- As re-entrant firing creates a new mutation level, no more mutations will be on this level.
-			-- Resume parameter storage thread to retrieve the variadics, and select with index 2, as coroutine.resume
-			-- returns a boolean as the first argument, which we don't want.
-			invokeListenersAndProcessMutations(signal, mutationList, select(2, coroutine.resume(mutation.p :: thread)))
+			processDispatch(signal, mutationList, table.unpack(mutation.a :: any))
 			return
 		end
 
@@ -477,41 +706,30 @@ const function invokeListenersAndProcessMutations(signal: InternalSignal, mutati
 	end
 end
 
---[[
-	Yields the current thread, and when resumed, returns the given parameters.
-]]
-const function yieldVariadicStack(...: any)
-	coroutine.yield()
-	return ...
-end
-
---[[
-	Stores the given parameters in a thread that immediately yields, and that when resumed, returns the parameters.
-]]
-const function storeVariadics<V...>(...: V...): (thread)
-	return spawnThread(yieldVariadicStack, ...)
-end
-
-function Signal.Fire(self: InternalSignal, ...: any)
+function Signal.Fire(self: InternalSignal, ...: any): ()
 	const mutations = self._mutations
-
 	if self._firing then
 		enqueueMutationLevel(mutations, {
-			p = storeVariadics(...)
+			a = {...}
 		})
-		return
-	end
+	else
+		self._firing = true
+		processDispatch(self, mutations, ...)
 
-	self._firing = true
-	invokeListenersAndProcessMutations(self, mutations, ...)
-	self._firing = nil
+		-- Only the first non-reentrant fire is not queued, and as it's "blocking" we can safely clear _firing
+		-- unconditionally since all other operations will have completed during invocation.
+		self._firing = nil
+	end
 end
 
-function Signal.FireNow(self: InternalSignal, ...: any)
-	const mutations = self._mutations
-
+function Signal.FireNow(self: InternalSignal, ...: any): ()
 	self._firing = true
-	invokeListenersAndProcessMutations(self, mutations, ...)
+
+	const mutations = self._mutations
+	processDispatch(self, mutations, ...)
+
+	-- FireNow cannot unconditionally clear _firing because it skips re-entrancy, and as such can return before other
+	-- invocations complete. Check that there are no more mutations before resetting the flag.
 	if not mutations[1] then
 		self._firing = nil
 	end
@@ -520,13 +738,32 @@ end
 -- Interface --
 const NamedSignal = {}
 
+type function unknownFallback(ty: type, fallback: type): (type)
+	return if ty.tag == "unknown" then fallback else ty
+end
+
 --[[
 	Returns a new <code>Signal</code>.
 ]]
-function NamedSignal.new<Signature>(): (Signal<Signature>)
+function NamedSignal.new<Signature>(): (Signal<unknownFallback<Signature, Types.DefaultSignature>>)
 	return setmetatable({
 		_mutations = {},
 	}, Signal) :: any
+end
+
+--[[
+	Returns a new <code>Signal</code> that fires when the given <code>RBXScriptSignal</code> fires.
+]]
+function NamedSignal.wrap<OtherSignal>(otherSignal: OtherSignal & RBXScriptSignal): (WrapSignal<OtherSignal>)
+	const signal: InternalSignal = setmetatable({
+		_mutations = {},
+	}, Signal) :: any
+
+	signal._wrapConnection = otherSignal:Connect(function(...: any): ()
+		signal:Fire(...)
+	end)
+
+	return signal :: any
 end
 
 return NamedSignal
